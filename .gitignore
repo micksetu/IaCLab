@@ -1,0 +1,4 @@
+.vagrant/
+*.log
+*-console.log
+.DS_Store

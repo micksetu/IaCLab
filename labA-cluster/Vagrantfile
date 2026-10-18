@@ -1,0 +1,92 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+#
+# IaC lab: a small Ubuntu cluster on VirtualBox, defined as code.
+# Lab A starts with two nodes. Section 3: add node03 to NODES below.
+
+# ---- Cluster settings ------------------------------------------------------
+NAT_NET  = "VagrantNet"        # VirtualBox NAT Network for the cluster
+NAT_CIDR = "10.20.20.0/24"     # kept separate from your manual BigDataNet
+MEMORY   = 1024                # MB per node
+CPUS     = 1
+
+NODES = {
+  "node01" => "10.20.20.11",
+  "node02" => "10.20.20.12",
+}
+
+# ---- Create the NAT Network if it does not exist (manual step 1) ----------
+def vboxmanage
+  dir = ENV["VBOX_MSI_INSTALL_PATH"] || ENV["VBOX_INSTALL_PATH"]
+  dir ? File.join(dir, "VBoxManage") : "VBoxManage"
+end
+
+def ensure_natnetwork(name, cidr)
+  existing = `"#{vboxmanage}" natnetwork list 2>&1`
+  return if existing =~ /^Name:\s+#{Regexp.escape(name)}\s*$/
+  puts "Creating NAT Network #{name} (#{cidr}, DHCP off)"
+  system(%Q("#{vboxmanage}" natnetwork add --netname #{name} --network #{cidr} --enable --dhcp off))
+end
+
+ensure_natnetwork(NAT_NET, NAT_CIDR) if ARGV.include?("up") || ARGV.include?("reload")
+
+# ---- /etc/hosts block, built from NODES (manual step: edit /etc/hosts) -----
+HOSTS = NODES.map { |name, ip| "#{ip} #{name}" }.join(";")
+
+# ---- Provisioning script, runs inside each VM after boot -------------------
+PROVISION = <<-SCRIPT
+set -e
+IP="$1"
+HOSTS_LIST="$2"   # e.g. "10.20.20.11 node01;10.20.20.12 node02"
+
+# Static IP on NIC2 (enp0s8). NIC1 (enp0s3) belongs to Vagrant for SSH.
+cat > /etc/netplan/60-cluster.yaml <<NETPLAN
+network:
+  version: 2
+  ethernets:
+    enp0s8:
+      dhcp4: false
+      addresses: [${IP}/24]
+NETPLAN
+chmod 600 /etc/netplan/60-cluster.yaml
+netplan apply
+
+# student user, same as the manual build
+if ! id student >/dev/null 2>&1; then
+  useradd -m -s /bin/bash student
+  echo "student:student" | chpasswd
+  usermod -aG sudo student
+fi
+
+# Replace the cluster block in /etc/hosts (safe to run again)
+sed -i '/# BEGIN cluster/,/# END cluster/d' /etc/hosts
+{
+  echo "# BEGIN cluster"
+  echo "$HOSTS_LIST" | tr ';' '\\n'
+  echo "# END cluster"
+} >> /etc/hosts
+
+echo "$(hostname) provisioned with ${IP}"
+SCRIPT
+
+# ---- The machines ---------------------------------------------------------
+Vagrant.configure("2") do |config|
+  config.vm.box = "ubuntu/jammy64"
+
+  NODES.each do |name, ip|
+    config.vm.define name do |node|
+      node.vm.hostname = name
+
+      node.vm.provider "virtualbox" do |vb|
+        vb.name   = "iac-#{name}"
+        vb.memory = MEMORY
+        vb.cpus   = CPUS
+        # NIC2 on the cluster NAT Network
+        vb.customize ["modifyvm", :id, "--nic2", "natnetwork", "--nat-network2", NAT_NET]
+        vb.customize ["modifyvm", :id, "--nicpromisc2", "allow-all"]
+      end
+
+      node.vm.provision "shell", inline: PROVISION, args: [ip, HOSTS]
+    end
+  end
+end
